@@ -25,7 +25,7 @@
 * IPC via named pipes
   - Containers communicate through named pipes over a shared volume
 * Graceful shutdown
-  - Handles SIGINT and SIGTERM cleanly, miners and server exit with proper cleanup
+  - Containers handle SIGINT and SIGTERM with proper cleanup
 
 ## How To Use
 
