@@ -1,215 +1,210 @@
 #include <iostream>
-#include "zlib.h"
+#include <fstream>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <cstring>
-#include <fstream>
 #include <csignal>
+#include <ctime>
+#include "../block.h"
 
-typedef struct {
-    int height;        // Incremental ID of the block in the chain
-    int timestamp;    // Time of the mine in seconds since epoch
-    unsigned int hash;        // Current block hash value
-    unsigned int prev_hash;    // Hash value of the previous block
-    int difficulty;    // Amount of preceding zeros in the hash
-    int nonce;        // Incremental integer to change the hash value
-    int relayed_by;    // Miner ID
-} BLOCK_T;
+struct MinerState {
+    int minerID = -1;
+    int difficulty = 0;
+    BLOCK_T blockToMine = {};
+};
 
-bool validateDifficulty(unsigned int checksum);
-unsigned int calculateChecksum(const BLOCK_T& block);
-int findNextAvailableMinerID();
-bool subscribeAndRequestBlock(int minerID, const std::string& minerPipeName, int serverPipeFD, std::ofstream& logFile);
-BLOCK_T tryToGetNewBlock(int minerPipeFD);
-void log_message(std::ofstream& logFile, const std::string& message);
+volatile sig_atomic_t running = 1;
+
+void sigint_handler(int /*signum*/) {
+    running = 0;
+}
+
+int claimMinerID();
+bool subscribeAndRequestBlock(MinerState &state, int serverFD, std::ofstream &log);
+void mineBlocks(MinerState &state, int serverFD, int minerFD, std::ofstream &log);
 void miner_func();
-void sigint_handler(int signum);
 
-BLOCK_T blockToMine;
-int difficulty = 0;
-const std::string minerPipePrefix = "/mnt/mta/miner_pipe_";
-const std::string serverPipeName = "/mnt/mta/server_pipe";
-const std::string miner_log_path = "/var/log/mtacoin.log";
+int claimMinerID() {
+    for (int i = 1; i <= MAX_MINERS; i++) {
+        std::string pipe = MINER_PIPE_PREFIX + std::to_string(i);
 
-bool validateDifficulty(unsigned int checksum) { //validates given checksum based on difficulty (number of leading zeroes)
-    int numOfLeadingZeroes = 0;
-
-    //count number of leading zeroes
-    for (int i = 31; i >= 0; i--) {
-        //shift right i bits AND 1
-        if ((checksum >> i) & 1)
-            break;
-        numOfLeadingZeroes++;
-    }
-    //valid checksum
-    if (numOfLeadingZeroes >= difficulty)
-        return true;
-
-    return false;
-}
-
-unsigned int calculateChecksum(const BLOCK_T &block) { //calculates checksum based on block's fields
-    //initialize crc
-    uLong crc = crc32(0L, Z_NULL, 0);
-
-    crc = crc32(crc, reinterpret_cast<const Bytef *>(&block.height), sizeof(block.height));
-    crc = crc32(crc, reinterpret_cast<const Bytef *>(&block.timestamp), sizeof(block.timestamp));
-    crc = crc32(crc, reinterpret_cast<const Bytef *>(&block.prev_hash), sizeof(block.prev_hash));
-    crc = crc32(crc, reinterpret_cast<const Bytef *>(&block.nonce), sizeof(block.nonce));
-    crc = crc32(crc, reinterpret_cast<const Bytef *>(&block.relayed_by), sizeof(block.relayed_by));
-
-    return crc;
-}
-
-int findNextAvailableMinerID() {
-
-    for (int i = 1; i <= 4; i++) { //maximum of 4 miners
-        std::string pipeNameToCheck = minerPipePrefix + std::to_string(i);
-
-        //check if pipe doesn't exist
-        if (access(pipeNameToCheck.c_str(), F_OK) == -1) {
+        if (mkfifo(pipe.c_str(), 0666) == 0) {
             return i;
+        }
+
+        if (errno != EEXIST) {
+            break;
         }
     }
 
-    return -1; //no available ID's
+    return -1; // no available ID's
 }
 
-bool subscribeAndRequestBlock(int minerID, const std::string& minerPipeName, int serverPipeFD, std::ofstream& logFile) {
-    std::string message = "Miner #" + std::to_string(minerID) + " sent connect request on " + minerPipeName;
-    //add "SUB:" header to request and log message
-    write(serverPipeFD, ("SUB:" + message).c_str(), message.length());
-    log_message(logFile, message);
+bool subscribeAndRequestBlock(MinerState &state, int serverFD, std::ofstream &log) {
+    std::string pipeName = MINER_PIPE_PREFIX + std::to_string(state.minerID);
+    std::string msg = HEADER_SUBSCRIBE + "Miner #" + std::to_string(state.minerID) +
+                      " sent connect request on " + pipeName;
 
-    //open pipe and wait for response from server
-    int minerPipeFD = open(minerPipeName.c_str(), O_RDONLY);
-
-    if (minerPipeFD == -1){
-        log_message(logFile, std::string("ERROR: Failed to open miner #" + std::to_string(minerID) + " pipe"));
+    ssize_t n = write(serverFD, msg.c_str(), msg.length());
+    if (n < 0) {
+        log_message(log, "ERROR: Failed to send subscription request: " + std::string(strerror(errno)));
         return false;
     }
 
-    read(minerPipeFD, &blockToMine, sizeof(BLOCK_T));
-    //log the block received data
-    char logBuffer[512];
-    std::sprintf(logBuffer, "Miner #%d received first block: relayed_by(%d), height(%d), timestamp (%d), hash(0x%x), prev_hash(0x%x), difficulty(%d), nonce(%d)",
-                 minerID, blockToMine.relayed_by, blockToMine.height, blockToMine.timestamp, blockToMine.hash, blockToMine.prev_hash, blockToMine.difficulty, blockToMine.nonce);
-    log_message(logFile, std::string(logBuffer));
+    log_message(log, msg.substr(LEN_HEADER));
 
-    close(minerPipeFD);
+    // open pipe and wait for response from server
+    int minerFD = open(pipeName.c_str(), O_RDONLY);
+    if (minerFD == -1) {
+        log_message(log, std::string("ERROR: Failed to open miner #" + std::to_string(state.minerID) + " pipe"));
+        return false;
+    }
+
+    n = read(minerFD, &state.blockToMine, sizeof(BLOCK_T));
+    close(minerFD);
+
+    if (n < 0) {
+        if (errno != EINTR) {
+            log_message(log, "ERROR: read failed: " + std::string(strerror(errno)));
+        }
+
+        return false;
+    }
+
+    if (n != static_cast<ssize_t>(sizeof(BLOCK_T))) {
+        log_message(log, "ERROR: Failed to read block from server");
+        return false;
+    }
+
+    char logBuffer[512];
+    std::sprintf(
+            logBuffer,
+            "Miner #%d received first block: relayed_by(%d), height(%d), timestamp (%d), hash(0x%x), prev_hash(0x%x), difficulty(%d), nonce(%d)",
+            state.minerID, state.blockToMine.relayed_by, state.blockToMine.height, state.blockToMine.timestamp,
+            state.blockToMine.hash, state.blockToMine.prev_hash, state.blockToMine.difficulty, state.blockToMine.nonce);
+    log_message(log, std::string(logBuffer));
 
     return true;
 }
 
-BLOCK_T tryToGetNewBlock(int minerPipeFD) {
-    BLOCK_T block = {};
+void mineBlocks(MinerState &state, int serverFD, int minerFD, std::ofstream &log) {
+    char logBuff[512];
+    char sendBuff[sizeof(BLOCK_T) + LEN_HEADER];
 
-    read(minerPipeFD, &block, sizeof(BLOCK_T));
+    memcpy(sendBuff, HEADER_BLOCK.c_str(), LEN_HEADER);
 
-    return block;
-}
+    while (running) {
+        state.blockToMine.relayed_by = state.minerID;
+        state.blockToMine.nonce = 0;
+        state.difficulty = state.blockToMine.difficulty;
 
-void log_message(std::ofstream& logFile, const std::string& message) {
-    logFile << message << std::endl;
-}
+        while (running) {
+            state.blockToMine.nonce++;
+            state.blockToMine.timestamp = static_cast<int>(time(nullptr));
+            state.blockToMine.hash = calculateChecksum(state.blockToMine);
 
-void miner_func() {
-    int minerID = findNextAvailableMinerID();
+            if (validateDifficulty(state.blockToMine.hash, state.difficulty)) {
+                std::sprintf(logBuff, "Miner #%d mined a new block #%d, with the hash 0x%x, difficulty %d",
+                             state.minerID,
+                             state.blockToMine.height, state.blockToMine.hash, state.blockToMine.difficulty);
+                log_message(log, std::string(logBuff));
 
-    if (minerID == -1)
-    {
-        std::cerr << "ERROR: No available ID's" << std::endl;
-        return;
-    }
-
-    std::ofstream logFile(miner_log_path);
-
-    if (!logFile.is_open()) {
-        std::cerr << "Failed to open log file: " << miner_log_path << std::endl;
-        return;
-    }
-
-    //create miner pipe
-    std::string minerPipeName = minerPipePrefix + std::to_string(minerID);
-    mkfifo(minerPipeName.c_str(), 0666);
-
-    //open server pipe
-    int serverPipeFD = open(serverPipeName.c_str(), O_WRONLY);
-
-    if (serverPipeFD == -1){
-        log_message(logFile, std::string("ERROR: Failed to open server pipe"));
-        logFile.close();
-        return;
-    }
-
-    //send connect request and get block from server
-    if (!subscribeAndRequestBlock(minerID, minerPipeName, serverPipeFD, logFile)) {
-        logFile.close();
-        close(serverPipeFD);
-        return;
-    }
-
-    //open miner pipe with non-blocking calls
-    int minerPipeFD = open(minerPipeName.c_str(), O_RDONLY | O_NONBLOCK);
-
-    if (minerPipeFD == -1){
-        log_message(logFile, std::string("ERROR: Failed to open miner #" + std::to_string(minerID) + " pipe"));
-        logFile.close();
-        close(serverPipeFD);
-        return;
-    }
-
-    //create buffer with fixed header symbolizing block data being sent
-    char buffer[sizeof(BLOCK_T) + 5] = {'B', 'L', 'K', ':'};
-    char logBuffer[256];
-
-    while (true)
-    {
-        blockToMine.relayed_by = minerID;
-        blockToMine.nonce = 0;
-        difficulty = blockToMine.difficulty;
-
-        while (true) {
-            blockToMine.nonce++;
-            blockToMine.timestamp = static_cast<int>(time(nullptr));
-            blockToMine.hash = calculateChecksum(blockToMine);
-
-            //validate mined block difficulty
-            if (validateDifficulty(blockToMine.hash)) {
-                std::sprintf(logBuffer, "Miner #%d mined a new block #%d, with the hash 0x%x, difficulty %d", minerID, blockToMine.height, blockToMine.hash, blockToMine.difficulty);
-                log_message(logFile, std::string(logBuffer));
-                //add block data after header ("BLK:")
-                memcpy(buffer + 4, &blockToMine, sizeof(BLOCK_T));
-                //write to server's pipe
-                write(serverPipeFD, buffer, sizeof(buffer));
+                // add block data after HEADER_BLOCK
+                memcpy(sendBuff + LEN_HEADER, &state.blockToMine, sizeof(BLOCK_T));
+                ssize_t n = write(serverFD, sendBuff, sizeof(sendBuff));
+                if (n < 0) {
+                    log_message(log, "ERROR: Failed to send mined block: " + std::string(strerror(errno)));
+                    return;
+                }
             }
-            //check if new block was sent
-            //if so, go to beginning of outside loop and process again
-            BLOCK_T block = tryToGetNewBlock(minerPipeFD);
 
-            if (block.height != 0 && block.height != blockToMine.height) {
-                //update to the newly received block and log accordingly
-                blockToMine = block;
-                std::sprintf(logBuffer, "Miner #%d received a new block: height(%d), timestamp (%d), hash(0x%x), prev_hash(0x%x), difficulty(%d), nonce(%d)",
-                             minerID, blockToMine.height, blockToMine.timestamp, blockToMine.hash, blockToMine.prev_hash, blockToMine.difficulty, blockToMine.nonce);
-                log_message(logFile, std::string(logBuffer));
+            // check if a new block is available
+            BLOCK_T incoming = {};
+            ssize_t n = read(minerFD, &incoming, sizeof(BLOCK_T));
+
+            if (n == static_cast<ssize_t>(sizeof(BLOCK_T)) && incoming.height != 0 && incoming.height != state.
+                    blockToMine.height) {
+                state.blockToMine = incoming;
+                std::sprintf(logBuff,
+                             "Miner #%d received a new block: height(%d), prev_hash(0x%x), difficulty(%d)",
+                             state.minerID, incoming.height, incoming.prev_hash, incoming.difficulty);
+                log_message(log, logBuff);
                 break;
             }
         }
     }
-
-    logFile.close();
-    close(serverPipeFD);
-    close(minerPipeFD);
 }
 
-void sigint_handler(int signum) {
-    exit(1);
+void miner_func() {
+    MinerState state;
+
+    state.minerID = claimMinerID();
+    if (state.minerID == -1) {
+        std::cerr << "ERROR: No available miner IDs (max " << MAX_MINERS << ")" << std::endl;
+        return;
+    }
+
+    std::string pipeName = MINER_PIPE_PREFIX + std::to_string(state.minerID);
+
+    std::ofstream log(LOG_PATH);
+    if (!log.is_open()) {
+        std::cerr << "Failed to open log file: " << LOG_PATH << std::endl;
+        unlink(pipeName.c_str());
+        return;
+    }
+
+    int serverFD = open(SERVER_PIPE.c_str(), O_WRONLY);
+    if (serverFD == -1) {
+        log_message(log, "ERROR: Failed to open server pipe");
+        log.close();
+        unlink(pipeName.c_str());
+        return;
+    }
+
+    if (!subscribeAndRequestBlock(state, serverFD, log)) {
+        close(serverFD);
+        log.close();
+        unlink(pipeName.c_str());
+        return;
+    }
+
+    int minerFD = open(pipeName.c_str(), O_RDONLY | O_NONBLOCK);
+    if (minerFD == -1) {
+        log_message(log, "ERROR: Failed to open miner pipe (non-blocking)");
+        close(serverFD);
+        log.close();
+        unlink(pipeName.c_str());
+
+        return;
+    }
+
+    mineBlocks(state, serverFD, minerFD, log);
+
+    log_message(log, "Miner #" + std::to_string(state.minerID) + " shutting down.");
+    close(minerFD);
+    close(serverFD);
+    unlink(pipeName.c_str());
+    log.close();
 }
 
-int main()
-{
-    signal(SIGINT, sigint_handler);
+int main() {
+    struct sigaction sa = {};
+    sa.sa_handler = sigint_handler;
+    sa.sa_flags = 0;
+
+    if (sigaction(SIGINT, &sa, nullptr) == -1 || sigaction(SIGTERM, &sa, nullptr) == -1) {
+        std::cerr << "Failed to set signal handler" << std::endl;
+        return 1;
+    }
+
+    struct sigaction sa_pipe = {};
+    sa_pipe.sa_handler = SIG_IGN;
+
+    if (sigaction(SIGPIPE, &sa_pipe, nullptr) == -1) {
+        std::cerr << "Failed to ignore SIGPIPE" << std::endl;
+        return 1;
+    }
+
     miner_func();
 
     return 0;

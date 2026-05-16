@@ -1,310 +1,307 @@
 #include <iostream>
 #include <fstream>
-#include "zlib.h"
 #include <list>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <cstring>
 #include <csignal>
+#include <ctime>
+#include "../block.h"
 
-typedef struct {
-    int height;        //Incremental ID of the block in the chain
-    int timestamp;    //Time of the mine in seconds since epoch
-    unsigned int hash;        //Current block hash value
-    unsigned int prev_hash;    //Hash value of the previous block
-    int difficulty;    //Amount of preceding zeros in the hash
-    int nonce;        //Incremental integer to change the hash value
-    int relayed_by;    //Miner ID
-} BLOCK_T;
+struct ServerState {
+    int difficulty = 0;
+    BLOCK_T blockToMine = {};
+    std::list<std::pair<int, int> > minerSubscribed; // (minerID, pipeFD)
+    std::list<BLOCK_T> blockchain;
+};
 
-unsigned int calculateChecksum(const BLOCK_T& block);
-bool validateDifficulty(unsigned int checksum);
-BLOCK_T createGenesisBlock();
-BLOCK_T createNewBlock(const BLOCK_T& minedBlock, const std::list<BLOCK_T>& blockchain);
-void readDifficulty(std::ofstream& logFile);
-void setDefaultDifficulty(std::ofstream& logFile);
-void sendBlockToMiner(int minerPipeFD, const BLOCK_T& newBlock);
-bool blockIsValid(unsigned int checksum, const std::list<BLOCK_T>& blockchain, const BLOCK_T& minedBlock, std::ofstream& logFile);
-void handleSubscriptionRequest(const char* buffer, std::list<int>& minersJoined, std::ofstream& logFile);
-void handleMinedBlockRequest(const char* buffer, std::list<BLOCK_T>& blockchain, std::ofstream& logFile);
-void log_message(std::ofstream& logFile, const std::string& message);
+volatile sig_atomic_t running = 1;
+
+void sigint_handler(int /*signum*/) {
+    running = 0;
+}
+
+void setDefaultDifficulty(ServerState &state, std::ofstream &log);
+void readDifficulty(ServerState &state, std::ofstream &log);
+BLOCK_T createGenesisBlock(int difficulty);
+BLOCK_T createNewBlock(const BLOCK_T &mined, int chainSize, int difficulty);
+bool sendBlockToMiner(int minerFD, const BLOCK_T &newBlock, std::ofstream &log);
+bool blockIsValid(unsigned int checksum, const ServerState &state, const BLOCK_T &minedBlock, std::ofstream &log);
+void handleSubscriptionRequest(const char *buffer, ServerState &state, std::ofstream &log);
+void handleMinedBlockRequest(const char *buffer, ServerState &state, std::ofstream &log);
+void run(ServerState &state, int serverFD, std::ofstream &log);
 void server_func();
-void sigint_handler(int signum);
 
-int difficulty = 0;
-BLOCK_T blockToMine = {};
-const std::string block_header = "BLK:";
-const std::string subscription_header = "SUB:";
-const char* server_pipe_name = "/mnt/mta/server_pipe";
-const char* server_log_name = "/var/log/mtacoin.log";
-const char* config_path = "/mnt/mta/mtacoin.conf";
-const int header_length = 4;
-//list of pairs (miner id, pipe fd)
-std::list<std::pair<int,int>> miner_subscribed;
-
-unsigned int calculateChecksum(const BLOCK_T &block) { //calculates checksum based on block's fields
-    //initialize crc
-    uLong crc = crc32(0L, Z_NULL, 0);
-
-    crc = crc32(crc, reinterpret_cast<const Bytef *>(&block.height), sizeof(block.height));
-    crc = crc32(crc, reinterpret_cast<const Bytef *>(&block.timestamp), sizeof(block.timestamp));
-    crc = crc32(crc, reinterpret_cast<const Bytef *>(&block.prev_hash), sizeof(block.prev_hash));
-    crc = crc32(crc, reinterpret_cast<const Bytef *>(&block.nonce), sizeof(block.nonce));
-    crc = crc32(crc, reinterpret_cast<const Bytef *>(&block.relayed_by), sizeof(block.relayed_by));
-
-    return crc;
+void setDefaultDifficulty(ServerState &state, std::ofstream &log) {
+    log_message(log, "Setting difficulty to 16 (default)");
+    state.difficulty = 16;
 }
 
-bool validateDifficulty(unsigned int checksum) { //validates given checksum based on difficulty (number of leading zeroes)
-    int numOfLeadingZeroes = 0;
-
-    //count number of leading zeroes
-    for (int i = 31; i >= 0; i--) {
-        //shift right i bits AND 1
-        if ((checksum >> i) & 1)
-            break;
-        numOfLeadingZeroes++;
+void readDifficulty(ServerState &state, std::ofstream &log) {
+    //open config file
+    int configFD = open(CONFIG_PATH.c_str(), O_RDONLY);
+    if (configFD == -1) {
+        log_message(log, "ERROR: No configuration file");
+        setDefaultDifficulty(state, log);
+        return;
     }
-    //valid checksum
-    if (numOfLeadingZeroes >= difficulty)
-        return true;
 
-    return false;
+
+    char buf[256];
+    ssize_t n = read(configFD, buf, sizeof(buf) - 1);
+
+    close(configFD);
+
+    if (n <= 0) {
+        log_message(log, "ERROR: No data in configuration file");
+        setDefaultDifficulty(state, log);
+        return;
+    }
+
+    buf[n] = '\0';
+    log_message(log, "Reading " + CONFIG_PATH + "..");
+
+    char *eq = strstr(buf, "DIFFICULTY") ? strchr(buf, '=') : nullptr;
+    if (!eq) {
+        log_message(log, "ERROR: Invalid format in config file");
+        setDefaultDifficulty(state, log);
+        return;
+    }
+
+    char *end;
+    long diff = strtol(eq + 1, &end, 10);
+
+    if (eq + 1 == end) {
+        log_message(log, "ERROR: No value for difficulty in config file");
+        setDefaultDifficulty(state, log);
+    } else if (diff >= 0 && diff <= 31) {
+        log_message(log, "Difficulty set to " + std::to_string(diff));
+        state.difficulty = static_cast<int>(diff);
+    } else {
+        log_message(log, "ERROR: Difficulty must be between 0 and 31");
+        setDefaultDifficulty(state, log);
+    }
 }
 
-BLOCK_T createGenesisBlock() {
-    //create genesis block
+BLOCK_T createGenesisBlock(int difficulty) {
     BLOCK_T genesisBlock = {};
 
     genesisBlock.difficulty = difficulty;
-    genesisBlock.prev_hash = 0;
-    genesisBlock.height = 0;
     genesisBlock.hash = 0xAAAAAAAA;
     genesisBlock.timestamp = static_cast<int>(time(nullptr));
     genesisBlock.relayed_by = -1;
-    genesisBlock.nonce = 0;
 
     return genesisBlock;
 }
 
-BLOCK_T createNewBlock(const BLOCK_T& minedBlock, const std::list<BLOCK_T>& blockchain){
-    BLOCK_T newBlock;
-    newBlock = {};
-    newBlock.prev_hash = minedBlock.hash;
-    newBlock.height = (int) blockchain.size();
-    newBlock.difficulty = difficulty;
+BLOCK_T createNewBlock(const BLOCK_T &mined, int chainSize, int difficulty) {
+    BLOCK_T block = {};
 
-    return newBlock;
+    block.prev_hash = mined.hash;
+    block.height = chainSize;
+    block.difficulty = difficulty;
+
+    return block;
 }
 
-void readDifficulty(std::ofstream& logFile) {
-    //open config file
-    int configFD = open(config_path, O_RDONLY);
-
-    if (configFD == -1) {
-        log_message(logFile, std::string("ERROR: No configuration file"));
-        setDefaultDifficulty(logFile);
-    }
-    else {
-        char buffer[256];
-        size_t bytesRead;
-
-        //log reading attempt and read from file
-        log_message(logFile, "Reading " + std::string(config_path) + "..");
-        bytesRead = read(configFD, buffer, 256);
-
-        if (bytesRead == -1) {
-            log_message(logFile, std::string("ERROR: No data in configuration file"));
-            setDefaultDifficulty(logFile);
-        }
-        else {
-            buffer[bytesRead] = '\0';
-            //search for expected template "DIFFICULTY="
-            //and get pointer to index of equal sign
-            char *equalsSign = strstr(buffer, "DIFFICULTY") ? strchr(buffer, '=') : nullptr;
-
-            //if found, parse number after equal sign
-            if (equalsSign) {
-                char* endPtr;
-                long tempDiff = strtol(equalsSign + 1, &endPtr, 10);
-
-                if (equalsSign + 1 == endPtr) {
-                    log_message(logFile, std::string("ERROR: No value for difficulty in config file"));
-                    setDefaultDifficulty(logFile);
-                }
-                else if (tempDiff >= 0 && tempDiff <= 31) {
-                    log_message(logFile, std::string("Difficulty set to " + std::to_string(tempDiff)));
-                    difficulty = static_cast<int>(tempDiff);
-                }
-                else{
-                    log_message(logFile, std::string("ERROR: Difficulty must be between 0 and 31"));
-                    setDefaultDifficulty(logFile);
-                }
-            }
-            else { //invalid data in config file
-                log_message(logFile, std::string("ERROR: Invalid format in config file"));
-                setDefaultDifficulty(logFile);
-            }
-        }
-
-        close(configFD);
-    }
-}
-
-void sendBlockToMiner(int minerPipeFD, const BLOCK_T &newBlock) {
-        write(minerPipeFD, &newBlock, sizeof(BLOCK_T));
-}
-
-void setDefaultDifficulty(std::ofstream& logFile) {
-    log_message(logFile, std::string("Setting difficulty to 16 (default)"));
-    difficulty = 16;
-}
-
-bool blockIsValid(unsigned int checksum, const std::list<BLOCK_T>& blockchain, const BLOCK_T& minedBlock, std::ofstream& logFile) { //validate mined block
-    char buffer[512];
-
-    //validate difficulty
-    if (!validateDifficulty(checksum)) {
-        std::sprintf(buffer, "Server: Miner #%d provided bad hash (0x%x) for block.", minedBlock.relayed_by, minedBlock.hash);
-        log_message(logFile, std::string(buffer));
-        return false;
-    }
-
-    //validate checksum
-    if (checksum != minedBlock.hash) {
-        std::sprintf(buffer, "Server: Miner #%d provided hash (0x%x) but server calculated (0x%x).", minedBlock.relayed_by, minedBlock.hash, checksum);
-        log_message(logFile, std::string(buffer));
-        return false;
-    }
-
-    //validate height and prev_hash
-    if (minedBlock.prev_hash != blockchain.front().hash || minedBlock.height != blockToMine.height) {
-        std::sprintf(buffer, "Server: Miner #%d provided incorrect prev_hash (0x%x), does not reference most recent block in blockchain (0x%x).", minedBlock.relayed_by, minedBlock.prev_hash, blockchain.front().hash);
-        log_message(logFile, std::string(buffer));
+bool sendBlockToMiner(int minerFD, const BLOCK_T &newBlock, std::ofstream &log) {
+    ssize_t n = write(minerFD, &newBlock, sizeof(BLOCK_T));
+    if (n < 0) {
+        log_message(log, "ERROR: Failed to send block to miner: " + std::string(strerror(errno)));
         return false;
     }
 
     return true;
 }
 
-void handleSubscriptionRequest(const char* buffer, std::list<int>& minersJoined, std::ofstream& logFile) {
-    std::string lineRead(buffer);
-    std::string prefix = "#";
-    std::size_t pos = lineRead.find(prefix);
+bool blockIsValid(unsigned int checksum, const ServerState &state, const BLOCK_T &minedBlock, std::ofstream &log) {
+    char buffer[512];
 
-    if (pos != std::string::npos) {
-        pos += 1;
-        int minerID = lineRead[pos] - '0';
-        std::string pipeName = "/mnt/mta/miner_pipe_";
-        std::string currentPipeName = pipeName + std::to_string(minerID);
+    if (!validateDifficulty(checksum, state.difficulty)) {
+        std::sprintf(buffer, "Miner #%d provided bad hash (0x%x) for block.", minedBlock.relayed_by,
+                     minedBlock.hash);
+        log_message(log, buffer);
+        return false;
+    }
 
-        int minerPipeFD = open(currentPipeName.c_str(), O_WRONLY);
+    if (checksum != minedBlock.hash) {
+        std::sprintf(buffer, "Miner #%d provided hash (0x%x) but server calculated (0x%x).",
+                     minedBlock.relayed_by, minedBlock.hash, checksum);
+        log_message(log, buffer);
+        return false;
+    }
 
-        if (minerPipeFD == -1) {
-            log_message(logFile, "Error opening miner #" + std::to_string(minerID) + " pipe");
-            return;
-        }
+    if (minedBlock.prev_hash != state.blockchain.front().hash || minedBlock.height != state.blockToMine.height) {
+        std::sprintf(
+                buffer,
+                "Miner #%d provided incorrect prev_hash (0x%x), does not reference most recent block in blockchain (0x%x).",
+                minedBlock.relayed_by, minedBlock.prev_hash, state.blockchain.front().hash);
+        log_message(log, buffer);
+        return false;
+    }
 
-        //add miner pipe fd to list of miners fd's
-        //add miner id to miners joined
-        miner_subscribed.emplace_back(minerID, minerPipeFD);
-        minersJoined.push_back(minerID);
-        log_message(logFile, "Received connection request from miner #" + std::to_string(minerID) + ", pipe name: " + "/mnt/mta/miner_pipe_" + std::to_string(minerID));
-        sendBlockToMiner(minerPipeFD, blockToMine);
+    return true;
+}
+
+void handleSubscriptionRequest(const char *buffer, ServerState &state, std::ofstream &log) {
+    std::string line(buffer);
+    std::size_t pos = line.find('#');
+
+    if (pos == std::string::npos) {
+        return;
+    }
+
+    int minerID;
+    try {
+        minerID = std::stoi(line.substr(pos + 1));
+    } catch (const std::exception &e) {
+        log_message(log, "ERROR: Failed to parse miner ID: " + std::string(e.what()));
+        return;
+    }
+
+    if (minerID <= 0 || minerID > MAX_MINERS) {
+        log_message(log, "ERROR: Invalid miner ID: " + std::to_string(minerID));
+        return;
+    }
+
+    std::string pipeName = MINER_PIPE_PREFIX + std::to_string(minerID);
+
+    int minerPipeFD = open(pipeName.c_str(), O_WRONLY); // could hang if miner 'dies' in-between handling
+    if (minerPipeFD == -1) {
+        log_message(log, "ERROR: Failed to open miner #" + std::to_string(minerID) + " pipe");
+        return;
+    }
+
+    state.minerSubscribed.emplace_back(minerID, minerPipeFD);
+    log_message(log, "Received connection request from miner #" + std::to_string(minerID) + ", pipe name: " + pipeName);
+
+    if (!sendBlockToMiner(minerPipeFD, state.blockToMine, log)) {
+        close(minerPipeFD);
+        state.minerSubscribed.pop_back();
+        return;
     }
 }
 
-void handleMinedBlockRequest(const char* buffer, std::list<BLOCK_T>& blockchain, std::ofstream& logFile) {
-    BLOCK_T minedBlock;
-    memcpy(&minedBlock, buffer + block_header.length(), sizeof(BLOCK_T));
+void handleMinedBlockRequest(const char *buffer, ServerState &state, std::ofstream &log) {
+    BLOCK_T minedBlock = {};
+    memcpy(&minedBlock, buffer + LEN_HEADER, sizeof(BLOCK_T));
     unsigned int checksum = calculateChecksum(minedBlock);
 
-    //validate block
-    if (blockIsValid(checksum, blockchain, minedBlock, logFile)) {
-        char logBuffer[256];
-        std::sprintf(logBuffer, "Server: New block added by %d, attributes: height(%d), timestamp (%d), hash(0x%x), prev_hash(0x%x), difficulty(%d), nonce(%d)",
-                     minedBlock.relayed_by, minedBlock.height, minedBlock.timestamp, minedBlock.hash, minedBlock.prev_hash, difficulty, minedBlock.nonce);
-        log_message(logFile, std::string(logBuffer));
+    if (!blockIsValid(checksum, state, minedBlock, log)) {
+        return;
+    }
 
-        //add mined block to blockchain
-        blockchain.push_front(minedBlock);
-        //create new block and send to miners pipe
-        blockToMine = createNewBlock(minedBlock, blockchain);
+    char logBuff[512];
+    std::sprintf(
+            logBuff,
+            "New block added by %d, attributes: height(%d), timestamp (%d), hash(0x%x), prev_hash(0x%x), difficulty(%d), nonce(%d)",
+            minedBlock.relayed_by, minedBlock.height, minedBlock.timestamp, minedBlock.hash, minedBlock.prev_hash,
+            state.difficulty, minedBlock.nonce);
+    log_message(log, logBuff);
 
-        //send new block to subscribed miners
-        for (auto& minerData : miner_subscribed) {
-            sendBlockToMiner(minerData.second, blockToMine);
+    state.blockchain.push_front(minedBlock);
+    state.blockToMine = createNewBlock(minedBlock, static_cast<int>(state.blockchain.size()), state.difficulty);
+
+    //send new block to subscribed miners
+    for (auto it = state.minerSubscribed.begin(); it != state.minerSubscribed.end(); ) {
+        if (sendBlockToMiner(it->second, state.blockToMine, log)) {
+            ++it;
+        }
+        else {
+            close(it->second);
+            it = state.minerSubscribed.erase(it);
         }
     }
 }
 
-void log_message(std::ofstream& logFile, const std::string& message) {
-    logFile << message << std::endl;
+void run(ServerState &state, int serverFD, std::ofstream &log) {
+    char buffer[512];
+
+    while (running) {
+        ssize_t bytesRead = read(serverFD, buffer, sizeof(buffer) - 1);
+
+        if (bytesRead < 0) {
+            if (errno != EINTR) {
+                log_message(log, "ERROR: read failed: " + std::string(strerror(errno)));
+            }
+
+            break;
+        }
+
+        if (bytesRead == 0) {
+            log_message(log, "All miners disconnected.");
+            break;
+        }
+
+        //check which type of data was read by checking the header
+        if (strncmp(buffer, HEADER_SUBSCRIBE.c_str(), LEN_HEADER) == 0) {
+            buffer[bytesRead] = '\0';
+            handleSubscriptionRequest(buffer, state, log);
+        } else if (strncmp(buffer, HEADER_BLOCK.c_str(), LEN_HEADER) == 0) {
+            handleMinedBlockRequest(buffer, state, log);
+        }
+    }
 }
 
 void server_func() {
-    std::ofstream logFile(server_log_name);
+    ServerState state;
 
-    if (!logFile.is_open()) {
-        std::cerr << "Failed to open log file: " << server_log_name << std::endl;
+    std::ofstream log(LOG_PATH);
+    if (!log.is_open()) {
+        std::cerr << "Failed to open log file: " << LOG_PATH << std::endl;
         return;
     }
 
-    readDifficulty(logFile);
-    mkfifo(server_pipe_name, 0666);
+    readDifficulty(state, log);
 
-    int serverPipeFD = open(server_pipe_name, O_RDONLY);
+    mkfifo(SERVER_PIPE.c_str(), 0666);
+    int serverFD = open(SERVER_PIPE.c_str(), O_RDONLY);
 
-    if (serverPipeFD == -1) {
-        log_message(logFile, std::string("ERROR: Failed to open server pipe"));
-        logFile.close();
+    if (serverFD == -1) {
+        log_message(log, "ERROR: Failed to open server pipe");
+        unlink(SERVER_PIPE.c_str());
+        log.close();
         return;
     }
 
-    log_message(logFile, "Listening on " + std::string(server_pipe_name));
+    log_message(log, "Listening on " + SERVER_PIPE);
 
-    char buffer[256];
-    std::list<int> minersJoined;
-    std::list<BLOCK_T> blockchain;
-    BLOCK_T genesisBlock = createGenesisBlock();
-
-    //add genesis block to blockchain
-    blockchain.push_front(genesisBlock);
+    BLOCK_T genesisBlock = createGenesisBlock(state.difficulty);
+    state.blockchain.push_front(genesisBlock);
 
     //create new block to mine based on genesis' data
-    blockToMine.prev_hash = blockchain.front().hash;
-    blockToMine.height = (int) blockchain.size();
-    blockToMine.difficulty = difficulty;
+    state.blockToMine.prev_hash = state.blockchain.front().hash;
+    state.blockToMine.height = 1;
+    state.blockToMine.difficulty = state.difficulty;
 
-    while (true) {
-        size_t bytesRead = read(serverPipeFD, buffer, 256);
+    run(state, serverFD, log);
 
-        if (bytesRead > 0) {
-            //check which type of data was read by checking the header
-            if (strncmp(buffer, subscription_header.c_str(), header_length) == 0)
-            {
-                buffer[bytesRead] = '\0';
-                handleSubscriptionRequest(buffer, minersJoined, logFile);
-            }
-            else if (strncmp(buffer, block_header.c_str(), header_length) == 0)
-            {
-                handleMinedBlockRequest(buffer, blockchain, logFile);
-            }
-        }
-    }
+    log_message(log, "Server shutting down.");
+    for (auto &m: state.minerSubscribed)
+        close(m.second);
 
-    logFile.close();
-    for(auto& minerData : miner_subscribed)
-        close(minerData.second);
-    close(serverPipeFD);
-}
-
-void sigint_handler(int signum) {
-    exit(1);
+    close(serverFD);
+    unlink(SERVER_PIPE.c_str());
+    log.close();
 }
 
 int main() {
-    signal(SIGINT, sigint_handler);
+    struct sigaction sa = {};
+    sa.sa_handler = sigint_handler;
+
+    if (sigaction(SIGINT, &sa, nullptr) == -1 || sigaction(SIGTERM, &sa, nullptr) == -1) {
+        std::cerr << "Failed to set signal handler" << std::endl;
+        return 1;
+    }
+
+    struct sigaction sa_pipe = {};
+    sa_pipe.sa_handler = SIG_IGN;
+
+    if (sigaction(SIGPIPE, &sa_pipe, nullptr) == -1) {
+        std::cerr << "Failed to ignore SIGPIPE" << std::endl;
+        return 1;
+    }
+
     server_func();
 
     return 0;

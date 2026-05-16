@@ -1,6 +1,6 @@
 FROM ubuntu:24.04
 
-RUN apt-get install -y zlib1g
+RUN apt-get update && apt-get install -y zlib1g
 
 # Create and set the working directory
 WORKDIR /usr/src/mtaminer

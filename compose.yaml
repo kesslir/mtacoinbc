@@ -1,0 +1,33 @@
+services:
+  server:
+    build: ./Server
+    volumes:
+      - ./conf/mta:/mnt/mta
+
+  miner1:
+    build: ./Miner
+    volumes:
+      - ./conf/mta:/mnt/mta
+    depends_on:
+      - server
+
+  miner2:
+    build: ./Miner
+    volumes:
+      - ./conf/mta:/mnt/mta
+    depends_on:
+      - server
+
+  miner3:
+    build: ./Miner
+    volumes:
+      - ./conf/mta:/mnt/mta
+    depends_on:
+      - server
+
+  miner4:
+    build: ./Miner
+    volumes:
+      - ./conf/mta:/mnt/mta
+    depends_on:
+      - server
