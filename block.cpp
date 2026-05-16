@@ -1,7 +1,9 @@
 #include "block.h"
+
+#include <iostream>
 #include <zlib.h>
 
-unsigned int calculateChecksum(const BLOCK_T &block) { 
+unsigned int calculateChecksum(const BLOCK_T &block) {
     uLong crc = crc32(0L, Z_NULL, 0);
 
     crc = crc32(crc, reinterpret_cast<const Bytef *>(&block.height), sizeof(block.height));
@@ -27,6 +29,10 @@ bool validateDifficulty(unsigned int checksum, int difficulty) {
     return numOfLeadingZeroes >= difficulty;
 }
 
-void log_message(std::ofstream& log, const std::string& message) {
-    log << message << std::endl;
+void log_message(const std::string &message) {
+    std::cout << message << std::endl;
+}
+
+void log_error(const std::string &message) {
+    std::cerr << message << std::endl;
 }
