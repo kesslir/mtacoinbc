@@ -15,11 +15,11 @@ struct BLOCK_T {
 inline constexpr int LEN_MESSAGE_MAX = 512;
 inline constexpr int LEN_HEADER = 4;
 inline constexpr int MAX_MINERS = 4;
-const std::string HEADER_BLOCK = "BLK:";
-const std::string HEADER_SUBSCRIBE = "SUB:";
-const std::string CONFIG_PATH = "/mnt/mta/mtacoin.conf";
-const std::string MINER_PIPE_PREFIX = "/mnt/mta/miner_pipe_";
-const std::string SERVER_PIPE = "/mnt/mta/server_pipe";
+inline const std::string HEADER_BLOCK = "BLK:";
+inline const std::string HEADER_SUBSCRIBE = "SUB:";
+inline const std::string CONFIG_PATH = "/mnt/mta/mtacoin.conf";
+inline const std::string MINER_PIPE_PREFIX = "/mnt/mta/miner_pipe_";
+inline const std::string SERVER_PIPE = "/mnt/mta/server_pipe";
 
 unsigned int calculateChecksum(const BLOCK_T &block);
 bool validateDifficulty(unsigned int checksum, int difficulty);

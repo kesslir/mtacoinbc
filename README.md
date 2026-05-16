@@ -18,8 +18,8 @@
 
 * Simulates a blockchain mining process
   - Miner containers continuously receive, mine (using CRC32) and submit blocks to the server for validation
-* Per-container logging
-  - Each container maintains its own log file, isolated from other containers
+* Logging
+  - Output is written to stdout and stderr, accessible via Docker's log viewing tools
 * Configurable difficulty
   - Control the number of leading zeros required in a valid block hash via a config file
 * IPC via named pipes
@@ -80,7 +80,6 @@ Valid range is 0-31. Defaults to 16 if the file is missing or invalid.
 * `Server/` contains all files relevant to the server container
 * `Miner/` contains all files relevant to the miner container
 * `conf/mta/` contains the `mtacoin.conf` configuration file
-* Log file is kept at `/var/log/mtacoin.log` within each container
 
 ## Credits
 
